@@ -1,0 +1,114 @@
+#cloud-config
+package_update: true
+packages:
+  - e2fsprogs
+  - nvme-cli
+
+write_files:
+  - path: /var/lib/cloud/scripts/per-boot/10-setup-ebs-data.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      LOG=/var/log/ebs-data-setup.log
+      exec >> "$LOG" 2>&1
+      echo "$(date '+%F %T') -- start"
+
+      # ---- Config ----
+      TARGET_DEV="${TARGET_DEV_OVERRIDE:-/dev/nvme1n1}"  # expected device
+      MNT="/data"
+      FS_TYPE="${FS_TYPE:-ext4}"          # ext4 (default) or xfs
+      LABEL_NAME="${LABEL_NAME:-DATA}"    # stable label for fstab
+      FSTAB="/etc/fstab"
+      BLOCK_BEGIN="# EBS-DATA-BEGIN"
+      BLOCK_END="# EBS-DATA-END"
+
+      wait_for_device() {
+        local dev="$1" tries=60
+        while [ $tries -gt 0 ]; do
+          if [ -b "$dev" ]; then return 0; fi
+          sleep 2; tries=$((tries-1))
+        done
+        return 1
+      }
+
+      # If the expected device isn't there, try autodetect a non-root NVMe disk
+      if [ ! -b "$TARGET_DEV" ]; then
+        for dev in $(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' \
+                     | grep -E '^/dev/nvme[0-9]+n1$' | grep -v '^/dev/nvme0n1$'); do
+          if wait_for_device "$dev"; then TARGET_DEV="$dev"; break; fi
+        done
+      else
+        wait_for_device "$TARGET_DEV"
+      fi
+
+      if [ ! -b "$TARGET_DEV" ]; then
+        echo "No data EBS device found; skipping."
+        exit 0
+      fi
+
+      udevadm settle || true
+      mkdir -p "$MNT"
+
+      # Detect existing filesystem
+      FS="$(blkid -o value -s TYPE "$TARGET_DEV" || true)"
+      if [ -z "${FS:-}" ]; then
+        echo "No filesystem on $TARGET_DEV. Creating $FS_TYPE..."
+        if [ "$FS_TYPE" = "ext4" ]; then
+          mkfs.ext4 -F -L "$LABEL_NAME" "$TARGET_DEV"
+          FS="ext4"
+        elif [ "$FS_TYPE" = "xfs" ]; then
+          mkfs.xfs -f -L "$LABEL_NAME" "$TARGET_DEV"
+          FS="xfs"
+        else
+          echo "Unsupported FS_TYPE: $FS_TYPE"; exit 1
+        fi
+      else
+        echo "Found filesystem $FS on $TARGET_DEV."
+        # Ensure a stable label so fstab doesn't depend on volatile paths
+        CUR_LABEL="$(blkid -o value -s LABEL "$TARGET_DEV" || true)"
+        if [ "$FS" = "ext4" ] && [ "$CUR_LABEL" != "$LABEL_NAME" ]; then
+          tune2fs -L "$LABEL_NAME" "$TARGET_DEV" || true
+        elif [ "$FS" = "xfs" ] && [ "$CUR_LABEL" != "$LABEL_NAME" ]; then
+          xfs_admin -L "$LABEL_NAME" "$TARGET_DEV" || true
+        fi
+      fi
+
+      # Prefer LABEL for fstab; fallback to UUID
+      CUR_LABEL="$(blkid -o value -s LABEL "$TARGET_DEV" || true)"
+      if [ -n "$CUR_LABEL" ]; then
+        SPEC="LABEL=$CUR_LABEL"
+      else
+        UUID="$(blkid -o value -s UUID "$TARGET_DEV")"
+        SPEC="UUID=$UUID"
+      fi
+
+      # fsck pass: ext4 uses 2, xfs uses 0
+      PASSNO=0
+      [ "$FS" = "ext4" ] && PASSNO=2
+
+      # Update /etc/fstab (managed block)
+      sed -i "/^$BLOCK_BEGIN$/,/^$BLOCK_END$/d" "$FSTAB"
+      {
+        echo "$BLOCK_BEGIN"
+        echo "$SPEC $MNT $FS defaults,nofail 0 $PASSNO"
+        echo "$BLOCK_END"
+      } >> "$FSTAB"
+
+      # Mount now if needed
+      if ! mountpoint -q "$MNT"; then
+        echo "Mounting $SPEC on $MNT..."
+        mount "$MNT" || mount -a
+      fi
+
+      # Enable weekly TRIM if available
+      if systemctl list-unit-files | grep -q '^fstrim.timer'; then
+        systemctl enable --now fstrim.timer || true
+      fi
+
+      echo "Done."
+
+runcmd:
+  - [ bash, -lc, 'echo "cloud-init applied: EBS /data setup (ext4 default)"' ]
